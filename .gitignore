@@ -1,0 +1,11 @@
+# TFRecord binary data files (large — download via instructions in README)
+data/*.tfrecord
+data/*.tfrecords
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
