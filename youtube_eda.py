@@ -20,6 +20,7 @@
 
 import csv, os, struct as _struct, warnings
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import duckdb
 import matplotlib.pyplot as plt
@@ -186,21 +187,21 @@ rows     = []    # scalar metadata — one dict per video
 pca_rgb  = []    # reservoir-sampled for PCA (up to MAX_PCA_SAMPLES)
 pca_audio = []
 
-for idx, shard in enumerate(TARGET_SHARDS):
-    shard_rows = 0
-    local_path = os.path.join(DATA_DIR, f"{shard}.tfrecord")
-
+# ── Worker: stream one shard and return its parsed records ──────
+# Runs in a thread pool so many shards are fetched concurrently.
+# GCS I/O releases the GIL, so threads genuinely overlap network waits.
+def _process_shard(args):
+    shard, local_path, is_local, pca_slots_left = args
+    shard_rows_out = []
+    pca_rgb_out    = []
+    pca_audio_out  = []
+    source = "local" if is_local else "gcs"
     try:
-        if shard in local_cache:
-            # Fast path: read from local disk
+        if is_local:
             fobj = open(local_path, "rb")
-            source = "local"
         else:
-            # Stream path: read directly from GCS, no disk write
             blob = gcs_bucket.blob(f"2/video/train/{shard}.tfrecord")
             fobj = blob.open("rb")
-            source = "gcs"
-
         with fobj as f:
             for raw in _iter_tfrecord(f):
                 rec   = parse_example(raw)
@@ -210,8 +211,7 @@ for idx, shard in enumerate(TARGET_SHARDS):
                 audio = rec.get("mean_audio")
                 if rgb is None or len(rgb) != 1024: continue
                 if audio is None or len(audio) != 128: continue
-
-                rows.append(dict(
+                shard_rows_out.append(dict(
                     video_id         = vid,
                     labels           = lbls,
                     primary_label_id = lbls[0] if lbls else -1,
@@ -223,20 +223,38 @@ for idx, shard in enumerate(TARGET_SHARDS):
                     audio_mean       = float(audio.mean()),
                     audio_std        = float(audio.std()),
                 ))
-                if len(pca_rgb) < MAX_PCA_SAMPLES:
-                    pca_rgb.append(rgb)
-                    pca_audio.append(audio)
-                shard_rows += 1
-
+                if len(pca_rgb_out) < pca_slots_left:
+                    pca_rgb_out.append(rgb)
+                    pca_audio_out.append(audio)
     except Exception as e:
         print(f"  WARNING: skipped {shard} ({source}) — {e}")
-        continue
+    return shard, source, shard_rows_out, pca_rgb_out, pca_audio_out
 
-    if (idx + 1) % 100 == 0 or (idx + 1) == NUM_SHARDS:
-        cached = sum(1 for s in TARGET_SHARDS[:idx+1] if s in local_cache)
-        print(f"  [{idx+1:4d}/{NUM_SHARDS}] shards processed  "
-              f"({cached} local / {idx+1-cached} streamed)  "
-              f"— {len(rows):,} videos total")
+# Build task list with per-shard PCA quota (approximate fair share)
+PARALLEL_WORKERS = 12   # concurrent GCS connections; tune down if you hit rate limits
+tasks = []
+for shard in TARGET_SHARDS:
+    local_path = os.path.join(DATA_DIR, f"{shard}.tfrecord")
+    is_local   = shard in local_cache
+    pca_slots  = max(0, MAX_PCA_SAMPLES - len(pca_rgb))  # updated lazily below
+    tasks.append((shard, local_path, is_local, MAX_PCA_SAMPLES // NUM_SHARDS + 200))
+
+completed = 0
+with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+    futures = {pool.submit(_process_shard, t): t[0] for t in tasks}
+    for fut in as_completed(futures):
+        shard, source, shard_rows_out, pca_rgb_out, pca_audio_out = fut.result()
+        rows.extend(shard_rows_out)
+        remaining = MAX_PCA_SAMPLES - len(pca_rgb)
+        if remaining > 0:
+            pca_rgb.extend(pca_rgb_out[:remaining])
+            pca_audio.extend(pca_audio_out[:remaining])
+        completed += 1
+        if completed % 100 == 0 or completed == NUM_SHARDS:
+            cached_done = sum(1 for t in tasks[:completed] if t[2])
+            print(f"  [{completed:4d}/{NUM_SHARDS}] shards done  "
+                  f"({cached_done} local / {completed-cached_done} streamed)  "
+                  f"— {len(rows):,} videos total")
 
 N = len(rows)
 print(f"\n  TOTAL: {N:,} real YouTube-8M videos")
