@@ -1,4 +1,5 @@
-# TFRecord binary data files (large — download via instructions in README)
+# TFRecord binary data files — large optional local cache
+# youtube_eda.py streams from GCS by default; these are never required.
 data/*.tfrecord
 data/*.tfrecords
 

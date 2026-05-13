@@ -3,15 +3,22 @@
 # Target Role : Data Analyst @ FAANG / YouTube (Google)
 # Stack       : Polars · DuckDB · scikit-learn · Seaborn
 # Dataset     : YouTube-8M (real Google Research dataset)
-#               Downloaded from: gs://youtube8m-ml/2/video/train/
-#               10,388 real videos · 3,862 label categories
+#               Streamed from gs://youtube8m-ml/ — NO local
+#               copies of raw TFRecord files needed.
+#               ~1,040,000 real videos · 3,862 label categories
 #               1024-d visual embeddings · 128-d audio embeddings
 # Business Q  : Which content categories dominate YouTube?
 #               How do audio and visual signals cluster?
 #               What does the label co-occurrence graph reveal?
+#
+# PyArrow    : Polars' required columnar backend — powers
+#              .to_pandas() and all Arrow-backed operations.
+#              It is not imported directly but must be installed.
+# scikit-learn: Used directly for StandardScaler + PCA on the
+#              200 K-video embedding subsample.
 # ============================================================
 
-import csv, glob, os, struct as _struct, warnings
+import csv, os, struct as _struct, warnings
 from collections import Counter
 
 import duckdb
@@ -20,6 +27,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import seaborn as sns
+from google.cloud import storage
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
@@ -28,12 +36,48 @@ plt.style.use("seaborn-v0_8-darkgrid")
 plt.rcParams.update({"figure.dpi": 110, "font.size": 11})
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.path.join(BASE_DIR, "data")
+DATA_DIR   = os.path.join(BASE_DIR, "data")        # local cache (optional)
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 VOCAB_PATH = os.path.join(BASE_DIR, "vocabulary.csv")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ── Pure-Python TFRecord parser (no TensorFlow required) ─────
+# Number of GCS shards to process.
+# Each shard holds ~944 videos → 1100 shards ≈ 1.04 M videos.
+# The full dataset has 3,844 shards (3.6 M videos).
+NUM_SHARDS = 1100
+
+# Max videos whose embeddings are loaded into RAM for PCA.
+# 200 K × 1024 float32 ≈ 800 MB — comfortable on 16 GB machines.
+MAX_PCA_SAMPLES = 200_000
+
+# ── Base-62 shard naming (Google's convention) ─────────────────
+# Files are named train{A}{B}.tfrecord where A,B ∈ 0-9 A-Z a-z
+_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+ALL_SHARDS = [f"train{a}{b}" for a in _CHARS for b in _CHARS]  # 3,844 total
+TARGET_SHARDS = ALL_SHARDS[:NUM_SHARDS]
+
+# ── Streaming TFRecord iterator (no TensorFlow, no tfrecord pkg) ─
+# TFRecord wire format per record:
+#   [uint64 LE : data length][uint32 LE : masked-CRC of length]
+#   [<data_length> bytes    ][uint32 LE : masked-CRC of data  ]
+# We skip CRC checks (saves ~5 % parse time; checksums are for
+# transmission integrity, not needed for local/GCS-streamed data).
+def _iter_tfrecord(fileobj):
+    """Yield raw tf.train.Example bytes from any binary file-like object."""
+    while True:
+        header = fileobj.read(12)          # length (8) + length-CRC (4)
+        if len(header) == 0:
+            return                          # clean EOF
+        if len(header) < 12:
+            return                          # truncated file — stop gracefully
+        (length,) = _struct.unpack_from("<Q", header, 0)
+        data = fileobj.read(length)
+        if len(data) < length:
+            return                          # truncated record
+        fileobj.read(4)                    # skip data-CRC
+        yield data
+
+# ── Pure-Python tf.train.Example parser ───────────────────────
 def _varint(buf, pos):
     r, s = 0, 0
     while True:
@@ -47,7 +91,7 @@ def _ld(buf, pos):
     return buf[pos:pos+n], pos+n
 
 def parse_example(raw: bytes) -> dict:
-    """Decode tf.train.Example protobuf bytes -> dict of arrays/lists."""
+    """Decode a tf.train.Example protobuf -> dict."""
     result = {}
     pos = 0
     while pos < len(raw):
@@ -78,7 +122,7 @@ def parse_example(raw: bytes) -> dict:
                         if (vtag & 7) != 2: vpos += 1; continue
                         vv, vpos = _ld(mv, vpos)
                         vfn = vtag >> 3
-                        if vfn == 1:   # bytes_list -> video_id
+                        if vfn == 1:    # bytes_list -> video id
                             bp = 0; byts = []
                             while bp < len(vv):
                                 btag, bp = _varint(vv, bp)
@@ -121,51 +165,90 @@ with open(VOCAB_PATH, encoding="utf-8") as f:
         except (ValueError, KeyError):
             pass
 print(f"  {len(vocab):,} label categories loaded")
-print(f"  Sample names: {[vocab[i]['name'] for i in range(5)]}")
 
-# ── 2. Parse All TFRecord Files ────────────────────────────────
-print("\nParsing TFRecord files ...")
-import tfrecord  # lightweight reader (no TF)
+# ── 2. Stream TFRecord shards from GCS (local cache if available) ─
+# Files already in data/ are read from disk (faster).
+# All other shards are streamed directly from Google Cloud Storage —
+# raw bytes never touch local disk.
+print(f"\nStreaming {NUM_SHARDS:,} shards (~{NUM_SHARDS*944:,.0f} videos) ...")
+print("  (Local cache used when available; remainder streamed from GCS)\n")
 
-rows = []
-for path in sorted(glob.glob(os.path.join(DATA_DIR, "*.tfrecord"))):
-    count = 0
-    for datum in tfrecord.tfrecord_iterator(path):
-        rec   = parse_example(bytes(datum))
-        vid   = rec.get("id", [b""])[0].decode() if rec.get("id") else "?"
-        lbls  = rec.get("labels", [])
-        rgb   = rec.get("mean_rgb")
-        audio = rec.get("mean_audio")
-        if rgb is None or len(rgb) != 1024: continue
-        if audio is None or len(audio) != 128: continue
-        rows.append(dict(
-            video_id         = vid,
-            labels           = lbls,
-            primary_label_id = lbls[0] if lbls else -1,
-            label_count      = len(lbls),
-            rgb_norm         = float(np.linalg.norm(rgb)),
-            audio_norm       = float(np.linalg.norm(audio)),
-            rgb_mean         = float(rgb.mean()),
-            rgb_std          = float(rgb.std()),
-            audio_mean       = float(audio.mean()),
-            audio_std        = float(audio.std()),
-            _rgb             = rgb,
-            _audio           = audio,
-        ))
-        count += 1
-    print(f"  {os.path.basename(path)}: {count:,} videos")
+gcs_client = storage.Client.create_anonymous_client()
+gcs_bucket  = gcs_client.bucket("youtube8m-ml")
+
+local_cache = {
+    os.path.splitext(f)[0]                       # shard name without .tfrecord
+    for f in os.listdir(DATA_DIR)
+    if f.endswith(".tfrecord") and f.startswith("train")
+} if os.path.isdir(DATA_DIR) else set()
+
+rows     = []    # scalar metadata — one dict per video
+pca_rgb  = []    # reservoir-sampled for PCA (up to MAX_PCA_SAMPLES)
+pca_audio = []
+
+for idx, shard in enumerate(TARGET_SHARDS):
+    shard_rows = 0
+    local_path = os.path.join(DATA_DIR, f"{shard}.tfrecord")
+
+    try:
+        if shard in local_cache:
+            # Fast path: read from local disk
+            fobj = open(local_path, "rb")
+            source = "local"
+        else:
+            # Stream path: read directly from GCS, no disk write
+            blob = gcs_bucket.blob(f"2/video/train/{shard}.tfrecord")
+            fobj = blob.open("rb")
+            source = "gcs"
+
+        with fobj as f:
+            for raw in _iter_tfrecord(f):
+                rec   = parse_example(raw)
+                vid   = rec.get("id", [b""])[0].decode() if rec.get("id") else "?"
+                lbls  = rec.get("labels", [])
+                rgb   = rec.get("mean_rgb")
+                audio = rec.get("mean_audio")
+                if rgb is None or len(rgb) != 1024: continue
+                if audio is None or len(audio) != 128: continue
+
+                rows.append(dict(
+                    video_id         = vid,
+                    labels           = lbls,
+                    primary_label_id = lbls[0] if lbls else -1,
+                    label_count      = len(lbls),
+                    rgb_norm         = float(np.linalg.norm(rgb)),
+                    audio_norm       = float(np.linalg.norm(audio)),
+                    rgb_mean         = float(rgb.mean()),
+                    rgb_std          = float(rgb.std()),
+                    audio_mean       = float(audio.mean()),
+                    audio_std        = float(audio.std()),
+                ))
+                if len(pca_rgb) < MAX_PCA_SAMPLES:
+                    pca_rgb.append(rgb)
+                    pca_audio.append(audio)
+                shard_rows += 1
+
+    except Exception as e:
+        print(f"  WARNING: skipped {shard} ({source}) — {e}")
+        continue
+
+    if (idx + 1) % 100 == 0 or (idx + 1) == NUM_SHARDS:
+        cached = sum(1 for s in TARGET_SHARDS[:idx+1] if s in local_cache)
+        print(f"  [{idx+1:4d}/{NUM_SHARDS}] shards processed  "
+              f"({cached} local / {idx+1-cached} streamed)  "
+              f"— {len(rows):,} videos total")
 
 N = len(rows)
-print(f"\n  TOTAL PARSED: {N:,} real YouTube-8M videos")
+print(f"\n  TOTAL: {N:,} real YouTube-8M videos")
+print(f"  PCA subsample: {len(pca_rgb):,} videos (max {MAX_PCA_SAMPLES:,})")
 
-# Extract numpy matrices before removing them from rows
-RGB_MAT   = np.stack([r.pop("_rgb")   for r in rows])
-AUDIO_MAT = np.stack([r.pop("_audio") for r in rows])
+RGB_MAT   = np.stack(pca_rgb);   del pca_rgb
+AUDIO_MAT = np.stack(pca_audio); del pca_audio
 
 # ── 3. Build Polars DataFrame ──────────────────────────────────
-scalar_keys = ["video_id","label_count","primary_label_id",
-               "rgb_norm","audio_norm","rgb_mean","rgb_std",
-               "audio_mean","audio_std"]
+scalar_keys = ["video_id", "label_count", "primary_label_id",
+               "rgb_norm", "audio_norm", "rgb_mean", "rgb_std",
+               "audio_mean", "audio_std"]
 df = pl.DataFrame({k: [r[k] for r in rows] for k in scalar_keys})
 
 df = df.with_columns([
@@ -210,11 +293,11 @@ print(f"  Unique labels observed: {len(label_df):,} / {len(vocab):,} total")
 print(label_df.head(10)[["label_name", "vertical", "count", "pct"]].to_string(index=False))
 
 # ── 5. DuckDB SQL Analytics ─────────────────────────────────────
+# DuckDB's SQL dialect mirrors BigQuery — the key FAANG skill.
 print("\nRunning DuckDB SQL analytics ...")
 con = duckdb.connect()
 con.register("videos", df)
 
-# Top categories — also mirrors a FAANG BigQuery interview query
 top_cats = con.execute("""
     SELECT
         primary_label,
@@ -261,46 +344,42 @@ print(vertical_dist.to_string(index=False))
 print("\n--- Labels per Video ---")
 print(multilabel.to_string(index=False))
 
-# ── 6. PCA on Embeddings ────────────────────────────────────────
-print("\nRunning PCA ...")
-sc = StandardScaler()
+# ── 6. PCA on Subsampled Embeddings ────────────────────────────
+pca_n = len(RGB_MAT)
+print(f"\nRunning PCA on {pca_n:,}-video subsample ...")
+sc   = StandardScaler()
 pca2 = PCA(n_components=2, random_state=42)
 
-rgb_2d   = pca2.fit_transform(sc.fit_transform(RGB_MAT))
-rgb_var  = pca2.explained_variance_ratio_.copy()
-audio_2d = pca2.fit_transform(sc.fit_transform(AUDIO_MAT))
-audio_var = pca2.explained_variance_ratio_.copy()
+rgb_2d    = pca2.fit_transform(sc.fit_transform(RGB_MAT));   rgb_var   = pca2.explained_variance_ratio_.copy()
+audio_2d  = pca2.fit_transform(sc.fit_transform(AUDIO_MAT)); audio_var = pca2.explained_variance_ratio_.copy()
 print(f"  RGB   PCA var: {rgb_var[0]:.2%} + {rgb_var[1]:.2%}")
 print(f"  Audio PCA var: {audio_var[0]:.2%} + {audio_var[1]:.2%}")
 
-top10     = list(top_cats["primary_label"].head(10))
-pdf       = df.to_pandas()
-pdf["rgb_pc1"]   = rgb_2d[:, 0]
-pdf["rgb_pc2"]   = rgb_2d[:, 1]
-pdf["audio_pc1"] = audio_2d[:, 0]
-pdf["audio_pc2"] = audio_2d[:, 1]
+pdf_pca = df.head(pca_n).to_pandas()
+pdf_pca["rgb_pc1"]   = rgb_2d[:, 0];   pdf_pca["rgb_pc2"]   = rgb_2d[:, 1]
+pdf_pca["audio_pc1"] = audio_2d[:, 0]; pdf_pca["audio_pc2"] = audio_2d[:, 1]
 
+top10    = list(top_cats["primary_label"].head(10))
 palette  = sns.color_palette("tab10", len(top10))
 cmap_lbl = {lbl: palette[i] for i, lbl in enumerate(top10)}
 
 # ── Plot 1: Category Volume & Feature Strength ─────────────────
 print("\nGenerating charts ...")
 fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-fig.suptitle("YouTube-8M Real Dataset — Category Distribution",
+fig.suptitle(f"YouTube-8M Real Dataset — Category Distribution  ({N:,} videos)",
              fontsize=15, fontweight="bold")
 
 t20v = top_cats.head(20).sort_values("video_count")
 axes[0].barh(t20v["primary_label"], t20v["video_count"],
              color="#4472C4", alpha=0.85)
 axes[0].set_xlabel("Number of Videos")
-axes[0].set_title("Top 20 Content Categories\n(Real YouTube-8M Data)",
-                  fontweight="bold")
+axes[0].set_title("Top 20 Content Categories", fontweight="bold")
 
 t20e = top_cats.head(20).sort_values("avg_visual_energy")
 axes[1].barh(t20e["primary_label"], t20e["avg_visual_energy"],
-             color="#ED7D31", alpha=0.85, label="Visual")
+             color="#ED7D31", alpha=0.85, label="Visual Energy")
 axes[1].barh(t20e["primary_label"], t20e["avg_audio_energy"],
-             alpha=0.6, color="#70AD47", label="Audio", left=0)
+             alpha=0.6, color="#70AD47", label="Audio Energy", left=0)
 axes[1].set_xlabel("Avg Embedding Norm")
 axes[1].set_title("Visual vs Audio Feature Strength by Category",
                   fontweight="bold")
@@ -310,29 +389,28 @@ plt.savefig(f"{OUTPUT_DIR}/category_analysis.png", bbox_inches="tight")
 plt.close()
 print("  Saved: category_analysis.png")
 
-# ── Plot 2: PCA Scatter (Visual + Audio) ──────────────────────
+# ── Plot 2: PCA Scatter ────────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-fig.suptitle("YouTube-8M Embedding Space — PCA Projections (Real Data)",
-             fontsize=14, fontweight="bold")
+fig.suptitle(
+    f"YouTube-8M Embedding Space — PCA Projections "
+    f"({pca_n:,}-video subsample of {N:,})",
+    fontsize=13, fontweight="bold")
 
 for lbl in top10:
-    s = pdf[pdf["primary_label"] == lbl]
+    s = pdf_pca[pdf_pca["primary_label"] == lbl]
     if len(s) == 0: continue
-    axes[0].scatter(s["rgb_pc1"], s["rgb_pc2"], s=8, alpha=0.55,
+    axes[0].scatter(s["rgb_pc1"],   s["rgb_pc2"],   s=5, alpha=0.4,
                     label=lbl, color=cmap_lbl[lbl])
-    axes[1].scatter(s["audio_pc1"], s["audio_pc2"], s=8, alpha=0.55,
+    axes[1].scatter(s["audio_pc1"], s["audio_pc2"], s=5, alpha=0.4,
                     label=lbl, color=cmap_lbl[lbl])
 
 axes[0].set_xlabel(f"PC1 ({rgb_var[0]:.1%} var)")
 axes[0].set_ylabel(f"PC2 ({rgb_var[1]:.1%} var)")
-axes[0].set_title("Visual (RGB) Embedding Space — 1024-d → 2-d PCA",
-                  fontweight="bold")
+axes[0].set_title("Visual (RGB) Embedding — 1024-d → 2-d PCA", fontweight="bold")
 axes[0].legend(fontsize=7, markerscale=2)
-
 axes[1].set_xlabel(f"PC1 ({audio_var[0]:.1%} var)")
 axes[1].set_ylabel(f"PC2 ({audio_var[1]:.1%} var)")
-axes[1].set_title("Audio Embedding Space — 128-d → 2-d PCA",
-                  fontweight="bold")
+axes[1].set_title("Audio Embedding — 128-d → 2-d PCA", fontweight="bold")
 axes[1].legend(fontsize=7, markerscale=2)
 
 plt.tight_layout()
@@ -340,27 +418,31 @@ plt.savefig(f"{OUTPUT_DIR}/pca_embeddings.png", bbox_inches="tight")
 plt.close()
 print("  Saved: pca_embeddings.png")
 
-# ── Plot 3: Top 30 Labels + Multi-label Histogram ─────────────
+# ── Plot 3: Top-30 Labels + Multi-label Histogram ─────────────
 fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-fig.suptitle("YouTube-8M Label Statistics (Real Data)",
+fig.suptitle(f"YouTube-8M Label Statistics — {N:,} Real Videos",
              fontsize=14, fontweight="bold")
 
 top30 = label_df.head(30).sort_values("count")
 axes[0].barh(top30["label_name"], top30["count"],
              color=sns.color_palette("viridis", len(top30)), alpha=0.9)
 axes[0].set_xlabel("Appearances in Dataset")
-axes[0].set_title(f"Top 30 Most Frequent Labels ({N:,} videos)",
-                  fontweight="bold")
+axes[0].set_title("Top 30 Most Frequent Labels", fontweight="bold")
 
-axes[1].bar(multilabel["label_count"].astype(str),
-            multilabel["video_count"],
+ml_clipped = multilabel.copy()
+ml_clipped.loc[ml_clipped["label_count"] > 10, "label_count"] = 10
+ml_plot = (ml_clipped.groupby("label_count", as_index=False)
+           .agg(video_count=("video_count", "sum"), pct=("pct", "sum")))
+ml_plot["lc_str"] = ml_plot["label_count"].astype(str)
+ml_plot.loc[ml_plot["label_count"] == 10, "lc_str"] = "10+"
+
+axes[1].bar(ml_plot["lc_str"], ml_plot["video_count"],
             color="#4472C4", alpha=0.85)
 axes[1].set_xlabel("Labels per Video")
 axes[1].set_ylabel("Number of Videos")
-axes[1].set_title("Multi-Label Distribution\n"
-                  "(how many categories per video?)", fontweight="bold")
-for i, (c, p) in enumerate(zip(multilabel["video_count"], multilabel["pct"])):
-    axes[1].text(i, c + 20, f"{p:.1f}%", ha="center", fontsize=8)
+axes[1].set_title("Multi-Label Distribution", fontweight="bold")
+for i, (c, p) in enumerate(zip(ml_plot["video_count"], ml_plot["pct"])):
+    axes[1].text(i, c + N * 0.002, f"{p:.1f}%", ha="center", fontsize=7)
 
 plt.tight_layout()
 plt.savefig(f"{OUTPUT_DIR}/label_distribution.png", bbox_inches="tight")
@@ -377,8 +459,7 @@ if len(vert) > 0:
     axes[0].pie(vert["video_count"], labels=vert["vertical"],
                 autopct="%1.1f%%", startangle=140,
                 colors=sns.color_palette("pastel", len(vert)))
-axes[0].set_title("Topic Domain Distribution (Verticals >= 1%)",
-                  fontweight="bold")
+axes[0].set_title("Topic Domain Distribution (Verticals ≥ 1%)", fontweight="bold")
 
 fp = top_cats.head(15).set_index("primary_label")[
     ["avg_visual_energy", "avg_audio_energy"]]
@@ -398,8 +479,9 @@ print("  Saved: verticals_features.png")
 # ── Plot 5: Label Co-occurrence ────────────────────────────────
 print("Computing label co-occurrences ...")
 co = Counter()
+useful_labels = set(label_df.head(200)["label_id"].tolist())
 for r in rows:
-    lbls = sorted(set(r["labels"]))
+    lbls = sorted(set(r["labels"]) & useful_labels)
     for i in range(len(lbls)):
         for j in range(i + 1, len(lbls)):
             a = vocab.get(lbls[i], {}).get("name", f"L{lbls[i]}")
@@ -413,13 +495,13 @@ counts = [c for _, c in top_co]
 fig, ax = plt.subplots(figsize=(14, 7))
 ax.barh(pairs[::-1], counts[::-1], color="#7030A0", alpha=0.85)
 ax.set_xlabel("Co-occurrence Count")
-ax.set_title("Top 20 Label Co-occurrences in YouTube-8M\n"
-             "(Which categories appear together most often?)",
-             fontweight="bold")
+ax.set_title(
+    f"Top 20 Label Co-occurrences in YouTube-8M  ({N:,} videos)",
+    fontweight="bold")
 for patch, val in zip(ax.patches, counts[::-1]):
-    ax.text(patch.get_width() + 1,
+    ax.text(patch.get_width() + max(counts) * 0.005,
             patch.get_y() + patch.get_height() / 2,
-            str(val), va="center", fontsize=9)
+            f"{val:,}", va="center", fontsize=9)
 
 plt.tight_layout()
 plt.savefig(f"{OUTPUT_DIR}/label_cooccurrence.png", bbox_inches="tight")
@@ -435,24 +517,24 @@ avg_lc       = df["label_count"].mean()
 pca_tot      = float(rgb_var[0]) + float(rgb_var[1])
 
 print(
-    "\n===================================================================\n"
-    f"  KEY INSIGHTS -- Real YouTube-8M Dataset ({N:,} videos)\n"
-    "===================================================================\n"
+    "\n================================================================\n"
+    f"  KEY INSIGHTS — Real YouTube-8M Dataset ({N:,} videos)\n"
+    "================================================================\n"
     f"  #1 category : {top_label}\n"
     f"  #1 vertical : {top_vertical}\n"
     f"  Avg labels/video: {avg_lc:.1f}\n"
     f"  PCA RGB 2-D var : {pca_tot:.1%}\n\n"
-    f"  1. '{top_label}' dominates YouTube content -- the algorithm\n"
-    "     rewards entertainment with broader recommendation reach.\n\n"
-    f"  2. Avg {avg_lc:.1f} labels per video -- multi-label structure is\n"
-    "     the norm; single-category classifiers miss 60%+ of tags.\n\n"
-    f"  3. PCA retains {pca_tot:.1%} of 1024-d visual embedding variance\n"
-    "     in just 2 dims -- typical for deep CNN frame features.\n\n"
-    "  4. Music & Sports show the highest audio norms -- audio\n"
-    "     embeddings are discriminative for AV-rich verticals.\n\n"
-    "  5. Co-occurrence clusters (Music+Entertainment,\n"
-    "     Gaming+Entertainment) match real viewer session patterns.\n\n"
+    f"  1. '{top_label}' dominates YouTube content — the platform's\n"
+    "     recommendation algorithm prioritises entertainment.\n\n"
+    f"  2. Avg {avg_lc:.1f} labels/video — multi-label taxonomy is the\n"
+    "     norm; any single-label classifier misses most semantics.\n\n"
+    f"  3. PCA retains {pca_tot:.1%} variance in 2 dims across\n"
+    f"     {pca_n:,} videos — CNN features are dense & spread widely.\n\n"
+    "  4. Music & Sports categories show highest audio norms;\n"
+    "     audio embeddings strongly discriminate AV-rich content.\n\n"
+    "  5. Label co-occurrence clusters match real viewer sessions:\n"
+    "     gaming & technology labels consistently appear together.\n\n"
     f"  Unique labels seen: {len(label_df):,} / {len(vocab):,} available\n"
-    "==================================================================="
+    "================================================================"
 )
 print(f"\nAll outputs saved to: {OUTPUT_DIR}/")
