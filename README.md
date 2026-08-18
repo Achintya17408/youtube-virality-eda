@@ -5,7 +5,7 @@
 
 ---
 
-## Why This Project Gets FAANG Attention
+## Why This Project Stands out in business logic
 
 
 
