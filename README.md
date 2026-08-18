@@ -5,7 +5,7 @@
 
 ---
 
-## Why This Project Stands out in business logic
+## What this project makes you learn
 
 
 
