@@ -1,13 +1,13 @@
 # Project 1 — YouTube Video Virality EDA
 
-**Target Role**: Data Analyst @ YouTube · Google · Meta (FAANG)
+
 **Business Question**: Which content and upload-timing features drive video virality across categories?
 
 ---
 
 ## Why This Project Gets FAANG Attention
 
-FAANG interviewers test three things beyond raw EDA skill:
+
 
 | What They Test | How This Project Shows It |
 |---|---|
